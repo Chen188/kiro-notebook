@@ -2,12 +2,14 @@
 """ACP Demo 4: Streaming output — show each chunk as it arrives with timing."""
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 import time
 
-KIRO = "/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli"
-CWD = "/Users/clawd/work/poc/260225_kiro_notebook"
+KIRO = shutil.which("kiro-cli") or "kiro-cli"
+CWD = os.getcwd()
 
 def jsonrpc(id, method, params):
     return json.dumps({"jsonrpc": "2.0", "id": id, "method": method, "params": params})

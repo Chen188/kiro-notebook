@@ -2,12 +2,13 @@
 """ACP Demo 2: Load a previous session (from test 1) in a NEW process."""
 
 import json
+import os
+import shutil
 import subprocess
 import sys
-import os
 
-KIRO = "/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli"
-CWD = "/Users/clawd/work/poc/260225_kiro_notebook"
+KIRO = shutil.which("kiro-cli") or "kiro-cli"
+CWD = os.getcwd()
 
 # Read session ID from test 1
 sid_file = "/tmp/acp_test_session_id.txt"
