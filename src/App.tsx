@@ -1,15 +1,19 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import PdfViewer from "./PdfViewer";
 import {
   FileText, FileType, FileCode, Globe, Paperclip, FolderOpen,
-  RefreshCw, Plus, ClipboardList, X, ChevronRight, ChevronDown,
-  ArrowUp, Square, Wrench, MessageSquare, Check,
+  RefreshCw, Plus, Minus, ClipboardList, X, ChevronRight, ChevronDown,
+  ArrowUp, Square, MessageSquare, Check, Quote, ShieldCheck,
+  ExternalLink, Copy, Loader2,
 } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 interface FileEntry {
@@ -30,6 +34,15 @@ interface ChatSession {
   messages: ChatMessage[];
   contextFiles?: string[];
   sentContextFiles?: string[];
+}
+
+interface ToolActivity {
+  toolCallId: string;
+  title: string;
+  kind: string;
+  detail: string;
+  status: string;
+  hadPermission: boolean;
 }
 
 const MODELS = [
@@ -65,9 +78,13 @@ export default function App() {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [statusText, setStatusText] = useState("");
+  const [toolActivitiesMap, setToolActivitiesMap] = useState<Record<number, ToolActivity[]>>({});
+  const [toolExpanded, setToolExpanded] = useState(false);
+  const currentToolMsgIdxRef = useRef<number>(-1);
   const [contextCollapsed, setContextCollapsed] = useState(false);
+  const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([]);
   const [previewWidth, setPreviewWidth] = useState(50);
+  const [zoomLevel, setZoomLevel] = useState(1);
   const [showHistory, setShowHistory] = useState(false);
   const [historyList, setHistoryList] = useState<ChatSession[]>([]);
   const [selectedModel, setSelectedModel] = useState("auto");
@@ -77,13 +94,25 @@ export default function App() {
   const panelsRef = useRef<HTMLDivElement>(null);
   const sentContextRef = useRef<Set<string>>(new Set());
   const currentSessionRef = useRef<string | null>(null);
+  const htmlIframeRef = useRef<HTMLIFrameElement>(null);
+  const chatInputRef = useRef<HTMLTextAreaElement>(null);
+  const [selectedText, setSelectedText] = useState("");
+  const [selectionPosition, setSelectionPosition] = useState<{ x: number; y: number } | null>(null);
 
   // Keep ref in sync
   useEffect(() => { currentSessionRef.current = currentSessionId; }, [currentSessionId]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, statusText]);
+  }, [messages, toolActivitiesMap]);
+
+  // Load recent workspaces from localStorage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem("kiro-notebook-recent-workspaces");
+      if (saved) setRecentWorkspaces(JSON.parse(saved));
+    } catch { /* ignore */ }
+  }, []);
 
   useEffect(() => {
     if (currentSessionId && messages.length > 0) {
@@ -115,18 +144,132 @@ export default function App() {
     return () => { window.removeEventListener("mousemove", onMouseMove); window.removeEventListener("mouseup", onMouseUp); };
   }, []);
 
+
+  // Selection detection for Quote in Chat
+  useEffect(() => {
+    const handleMouseUp = (e: MouseEvent) => {
+      // Check main document selection (PDF/MD/TXT)
+      let text = window.getSelection()?.toString().trim() || "";
+
+      // Check HTML iframe selection if no main selection
+      if (!text && htmlIframeRef.current?.contentWindow) {
+        try {
+          text = htmlIframeRef.current.contentWindow.getSelection()?.toString().trim() || "";
+        } catch {
+          // cross-origin fallback — ignore
+        }
+      }
+
+      if (text) {
+        setSelectedText(text);
+        setSelectionPosition({ x: e.clientX, y: e.clientY });
+      } else {
+        setSelectedText("");
+        setSelectionPosition(null);
+      }
+    };
+
+    const previewEl = document.querySelector(".preview-content");
+    previewEl?.addEventListener("mouseup", handleMouseUp as EventListener);
+
+    // Attach listener inside HTML iframe when it loads
+    const iframe = htmlIframeRef.current;
+    const attachIframeListener = () => {
+      try {
+        const doc = iframe?.contentDocument;
+        if (doc) {
+          doc.addEventListener("mouseup", ((e: Event) => {
+            const me = e as MouseEvent;
+            let text = "";
+            try {
+              text = iframe?.contentWindow?.getSelection()?.toString().trim() || "";
+            } catch { /* ignore */ }
+            if (text) {
+              // Map iframe coords to parent viewport
+              const rect = iframe!.getBoundingClientRect();
+              setSelectedText(text);
+              setSelectionPosition({ x: rect.left + me.clientX, y: rect.top + me.clientY });
+            } else {
+              setSelectedText("");
+              setSelectionPosition(null);
+            }
+          }) as EventListener);
+        }
+      } catch { /* cross-origin fallback */ }
+    };
+    iframe?.addEventListener("load", attachIframeListener);
+
+    // Clear selection when clicking outside preview
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      if (!target.closest(".preview-content") && !target.closest(".quote-button")) {
+        setSelectedText("");
+        setSelectionPosition(null);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+
+    return () => {
+      previewEl?.removeEventListener("mouseup", handleMouseUp as EventListener);
+      iframe?.removeEventListener("load", attachIframeListener);
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [selectedFile]);
+
+  const quoteInChat = useCallback(() => {
+    const quoted = selectedText
+      .split("\n")
+      .map((line) => `> ${line}`)
+      .join("\n");
+    setInput((prev) => (prev ? prev + "\n\n" + quoted + "\n\n" : quoted + "\n\n"));
+    setSelectedText("");
+    setSelectionPosition(null);
+    // Focus the chat textarea
+    setTimeout(() => chatInputRef.current?.focus(), 0);
+  }, [selectedText]);
+
+  const saveWorkspaceHistory = useCallback((path: string) => {
+    try {
+      const saved = localStorage.getItem("kiro-notebook-recent-workspaces");
+      let history: string[] = saved ? JSON.parse(saved) : [];
+      history = [path, ...history.filter((p) => p !== path)].slice(0, 10);
+      localStorage.setItem("kiro-notebook-recent-workspaces", JSON.stringify(history));
+      setRecentWorkspaces(history);
+    } catch { /* ignore */ }
+  }, []);
+
+  const initWorkspace = useCallback(async (path: string) => {
+    const canonical = await invoke<string>("select_workspace", { path });
+    setWorkspace(canonical);
+    saveWorkspaceHistory(canonical);
+    setSelectedFile(null);
+    setFileContent("");
+    setContextFiles(new Set());
+    setMessages([]);
+    setToolActivitiesMap({});
+    currentToolMsgIdxRef.current = -1;
+    setFiles(await invoke<FileEntry[]>("list_files"));
+  }, [saveWorkspaceHistory]);
+
   const openWorkspace = useCallback(async () => {
     const selected = await open({ directory: true, multiple: false });
-    if (selected) {
-      const path = await invoke<string>("select_workspace", { path: selected });
-      setWorkspace(path);
-      setSelectedFile(null);
-      setFileContent("");
-      setContextFiles(new Set());
-      setMessages([]);
-      setFiles(await invoke<FileEntry[]>("list_files"));
+    if (selected) await initWorkspace(selected as string);
+  }, [initWorkspace]);
+
+  const openRecentWorkspace = useCallback(async (path: string) => {
+    try {
+      await initWorkspace(path);
+    } catch {
+      // Path no longer exists — remove from history
+      try {
+        const saved = localStorage.getItem("kiro-notebook-recent-workspaces");
+        let history: string[] = saved ? JSON.parse(saved) : [];
+        history = history.filter((p) => p !== path);
+        localStorage.setItem("kiro-notebook-recent-workspaces", JSON.stringify(history));
+        setRecentWorkspaces(history);
+      } catch { /* ignore */ }
     }
-  }, []);
+  }, [initWorkspace]);
 
   const refreshFiles = useCallback(async () => {
     setFiles(await invoke<FileEntry[]>("list_files"));
@@ -134,8 +277,10 @@ export default function App() {
 
   const selectFile = useCallback(async (file: FileEntry) => {
     setSelectedFile(file);
+    setZoomLevel(1);
+    getCurrentWebview().setZoom(1);
     setContextFiles((prev) => new Set(prev).add(file.path));
-    if (file.extension === "pdf" || file.extension === "html") {
+    if (file.extension === "pdf") {
       setFileContent("");
       return;
     }
@@ -174,9 +319,12 @@ export default function App() {
   const runPrompt = useCallback(
     async (sessionId: string, message: string, ctx: string[]) => {
       streamingRef.current = "";
-      setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
+      setMessages((prev) => {
+        currentToolMsgIdxRef.current = prev.length;
+        return [...prev, { role: "assistant", content: "" }];
+      });
       setLoading(true);
-      setStatusText("");
+      setToolExpanded(false);
 
       const unlisten1 = await listen<{ sessionId: string; text: string }>("acp-chunk", (e) => {
         if (e.payload.sessionId !== sessionId) return;
@@ -188,10 +336,64 @@ export default function App() {
         });
       });
 
-      const unlisten2 = await listen<{ sessionId: string; type: string; title?: string; status?: string }>("acp-status", (e) => {
+      const unlisten2 = await listen<{ sessionId: string; type: string; title?: string; status?: string; kind?: string; detail?: string; option?: string; toolCallId?: string }>("acp-status", (e) => {
         if (e.payload.sessionId !== sessionId) return;
-        if (e.payload.type === "tool_call") setStatusText(e.payload.title || "Working...");
-        else if (e.payload.type === "tool_update" && e.payload.status === "completed") setStatusText("");
+        const idx = currentToolMsgIdxRef.current;
+        if (idx < 0) return;
+
+        if (e.payload.type === "tool_call") {
+          const tcId = e.payload.toolCallId || "";
+          setToolActivitiesMap((prev) => {
+            const activities = [...(prev[idx] || [])];
+            // Check if this toolCallId already exists (second update with rawInput)
+            const existingIdx = tcId ? activities.findIndex((a) => a.toolCallId === tcId) : -1;
+            if (existingIdx >= 0) {
+              // Update existing entry with new title/detail
+              activities[existingIdx] = {
+                ...activities[existingIdx],
+                title: e.payload.title || activities[existingIdx].title,
+                detail: e.payload.detail || activities[existingIdx].detail,
+                kind: e.payload.kind || activities[existingIdx].kind,
+              };
+              return { ...prev, [idx]: activities };
+            }
+            // New tool: mark all previous non-completed as completed (fixes spinning icon bug)
+            const marked = activities.map((a) => a.status !== "completed" ? { ...a, status: "completed" } : a);
+            marked.push({
+              toolCallId: tcId,
+              title: e.payload.title || "Working...",
+              kind: e.payload.kind || "",
+              detail: e.payload.detail || "",
+              status: "running",
+              hadPermission: false,
+            });
+            return { ...prev, [idx]: marked };
+          });
+        } else if (e.payload.type === "tool_update") {
+          setToolActivitiesMap((prev) => {
+            const activities = [...(prev[idx] || [])];
+            if (activities.length === 0) return prev;
+            for (let j = activities.length - 1; j >= 0; j--) {
+              if (activities[j].status !== "completed") {
+                activities[j] = { ...activities[j], status: e.payload.status || activities[j].status };
+                break;
+              }
+            }
+            return { ...prev, [idx]: activities };
+          });
+        } else if (e.payload.type === "permission") {
+          setToolActivitiesMap((prev) => {
+            const activities = [...(prev[idx] || [])];
+            if (activities.length === 0) return prev;
+            for (let j = activities.length - 1; j >= 0; j--) {
+              if (activities[j].status !== "completed") {
+                activities[j] = { ...activities[j], detail: e.payload.detail || activities[j].detail, hadPermission: true };
+                return { ...prev, [idx]: activities };
+              }
+            }
+            return prev;
+          });
+        }
       });
 
       try {
@@ -207,7 +409,16 @@ export default function App() {
       unlisten1();
       unlisten2();
       setLoading(false);
-      setStatusText("");
+      // Mark all remaining activities as completed when prompt finishes
+      const finalIdx = currentToolMsgIdxRef.current;
+      if (finalIdx >= 0) {
+        setToolActivitiesMap((prev) => {
+          const activities = prev[finalIdx];
+          if (!activities) return prev;
+          const completed = activities.map((a) => a.status !== "completed" ? { ...a, status: "completed" } : a);
+          return { ...prev, [finalIdx]: completed };
+        });
+      }
     },
     [],
   );
@@ -252,6 +463,8 @@ export default function App() {
       const label = `${new Date().toLocaleString()} · ${sessionId.slice(0, 8)}`;
       setSessions((prev) => [...prev, { id: sessionId, label, messages: [], contextFiles: curCtx }]);
       setMessages([]);
+      setToolActivitiesMap({});
+      currentToolMsgIdxRef.current = -1;
       sentContextRef.current = new Set();
       if (selectedModel !== "auto") {
         await invoke("set_model", { sessionId, modelId: selectedModel }).catch(() => {});
@@ -271,6 +484,8 @@ export default function App() {
       if (target) {
         setCurrentSessionId(sessionId);
         setMessages(target.messages);
+        setToolActivitiesMap({});
+        currentToolMsgIdxRef.current = -1;
         setContextFiles(new Set(target.contextFiles || []));
         sentContextRef.current = new Set(target.sentContextFiles || []);
       }
@@ -289,11 +504,15 @@ export default function App() {
           const last = remaining[remaining.length - 1];
           setCurrentSessionId(last.id);
           setMessages(last.messages);
+          setToolActivitiesMap({});
+          currentToolMsgIdxRef.current = -1;
           setContextFiles(new Set(last.contextFiles || []));
           sentContextRef.current = new Set(last.sentContextFiles || []);
         } else {
           setCurrentSessionId(null);
           setMessages([]);
+          setToolActivitiesMap({});
+          currentToolMsgIdxRef.current = -1;
           setContextFiles(new Set());
           sentContextRef.current = new Set();
         }
@@ -326,6 +545,8 @@ export default function App() {
         const loaded = { ...session, id: newId };
         setCurrentSessionId(newId);
         setMessages(session.messages);
+        setToolActivitiesMap({});
+        currentToolMsgIdxRef.current = -1;
         if (session.contextFiles?.length) {
           setContextFiles(new Set(session.contextFiles));
         }
@@ -368,6 +589,29 @@ export default function App() {
           <p>Your local AI-powered document assistant</p>
           <p className="subtitle">Powered by Kiro CLI via Agent Client Protocol</p>
           <button onClick={openWorkspace} className="btn-primary"><FolderOpen size={16} /> Open Workspace</button>
+          {recentWorkspaces.length > 0 && (
+            <div className="recent-workspaces">
+              <h3>Recent</h3>
+              {recentWorkspaces.map((p) => {
+                const folderName = p.split("/").pop() || p;
+                return (
+                  <div key={p} className="recent-item" onClick={() => openRecentWorkspace(p)} title={p}>
+                    <FolderOpen size={16} className="recent-item-icon" />
+                    <div className="recent-item-text">
+                      <span className="recent-item-name">{folderName}</span>
+                      <span className="recent-item-path">{p}</span>
+                    </div>
+                    <button className="recent-item-remove" onClick={(e) => {
+                      e.stopPropagation();
+                      const updated = recentWorkspaces.filter((x) => x !== p);
+                      localStorage.setItem("kiro-notebook-recent-workspaces", JSON.stringify(updated));
+                      setRecentWorkspaces(updated);
+                    }}><X size={12} /></button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
     );
@@ -421,13 +665,18 @@ export default function App() {
             <div className="panel-header">
               Preview
               {selectedFile && <span className="preview-filename">{selectedFile.name}</span>}
+              <div className="zoom-controls">
+                <button className="zoom-btn" onClick={() => { const z = Math.max(0.2, zoomLevel - 0.1); setZoomLevel(z); getCurrentWebview().setZoom(z); }} title="Zoom out"><Minus size={12} /></button>
+                <button className="zoom-label" onClick={() => { setZoomLevel(1); getCurrentWebview().setZoom(1); }} title="Reset zoom">{Math.round(zoomLevel * 100)}%</button>
+                <button className="zoom-btn" onClick={() => { const z = Math.min(5, zoomLevel + 0.1); setZoomLevel(z); getCurrentWebview().setZoom(z); }} title="Zoom in"><Plus size={12} /></button>
+              </div>
             </div>
             <div className="preview-content">
               {selectedFile ? (
                 selectedFile.extension === "pdf" ? (
-                  <iframe src={convertFileSrc(selectedFile.path) + "#view=FitH"} className="preview-iframe" />
+                  <PdfViewer url={convertFileSrc(selectedFile.path)} />
                 ) : selectedFile.extension === "html" ? (
-                  <iframe src={convertFileSrc(selectedFile.path)} className="preview-iframe" />
+                  <iframe ref={htmlIframeRef} srcDoc={fileContent} sandbox="allow-same-origin" className="preview-iframe" />
                 ) : selectedFile.extension === "md" || selectedFile.extension === "docx" ? (
                   <div className="markdown-body"><ReactMarkdown remarkPlugins={[remarkGfm]}>{fileContent}</ReactMarkdown></div>
                 ) : (
@@ -435,6 +684,15 @@ export default function App() {
                 )
               ) : (
                 <div className="empty-state">Select a file to preview its content</div>
+              )}
+              {selectedText && selectionPosition && (
+                <button
+                  className="quote-button"
+                  style={{ position: "fixed", left: selectionPosition.x, top: selectionPosition.y + 10 }}
+                  onClick={quoteInChat}
+                >
+                  <Quote size={14} /> Quote in Chat
+                </button>
               )}
             </div>
           </div>
@@ -516,22 +774,85 @@ export default function App() {
               </div>
             )}
             <div className="chat-messages">
-              {messages.map((msg, i) => (
-                <div key={i} className={`message ${msg.role}`}>
-                  <div className="message-bubble">
-                    {msg.role === "assistant" ? (
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-                    ) : msg.content}
+              {messages.map((msg, i) => {
+                const activities = toolActivitiesMap[i] || [];
+                const isStreaming = loading && i === messages.length - 1;
+                const showTools = msg.role === "assistant" && activities.length > 0;
+                return (
+                  <div key={i}>
+                    {showTools && (
+                      <div className={`tool-panel ${isStreaming ? "active" : "done"}`}>
+                        <div className="tool-panel-header" onClick={() => setToolExpanded((v) => !v)}>
+                          {isStreaming ? (
+                            <Loader2 size={13} className="tool-panel-icon spin" />
+                          ) : (
+                            <Check size={13} className="tool-panel-icon done" />
+                          )}
+                          <span className="tool-panel-title">
+                            {(() => {
+                              const active = activities.filter((a) => a.status !== "completed");
+                              if (isStreaming && active.length > 0) {
+                                return active[active.length - 1].title;
+                              }
+                              return `Used ${activities.length} tool${activities.length > 1 ? "s" : ""}`;
+                            })()}
+                          </span>
+                          {activities.length > 1 && (
+                            <span className="tool-panel-count">{activities.length}</span>
+                          )}
+                          {toolExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                        </div>
+                        {toolExpanded && (
+                          <div className="tool-panel-body">
+                            {activities.map((a, j) => (
+                              <div key={j} className={`tool-row ${a.status === "completed" ? "completed" : ""}`}>
+                                {a.status === "completed" ? (
+                                  <Check size={11} className="tool-row-icon done" />
+                                ) : (
+                                  <Loader2 size={11} className="tool-row-icon spin" />
+                                )}
+                                <span className="tool-row-title">{a.title}</span>
+                                {a.hadPermission && <ShieldCheck size={10} className="tool-row-shield" />}
+                                {a.detail && (
+                                  <span className="tool-row-detail-group">
+                                    <span className="tool-row-detail" title={a.detail}>{a.detail}</span>
+                                    <button className="tool-row-btn" title="Copy" onClick={(ev) => { ev.stopPropagation(); navigator.clipboard.writeText(a.detail); }}><Copy size={10} /></button>
+                                    {/^https?:\/\//.test(a.detail) && (
+                                      <button className="tool-row-btn" title="Open" onClick={(ev) => { ev.stopPropagation(); openUrl(a.detail).catch(() => {}); }}><ExternalLink size={10} /></button>
+                                    )}
+                                  </span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {msg.role === "assistant" && isStreaming && !msg.content ? (
+                      !showTools && (
+                        <div className="message assistant">
+                          <div className="message-bubble typing-indicator">
+                            <span /><span /><span />
+                          </div>
+                        </div>
+                      )
+                    ) : (
+                      <div className={`message ${msg.role}`}>
+                        <div className="message-bubble">
+                          {msg.role === "assistant" ? (
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                          ) : msg.content}
+                        </div>
+                      </div>
+                    )}
                   </div>
-                </div>
-              ))}
-              {loading && statusText && (
-                <div className="message status"><div className="status-bubble"><Wrench size={12} className="spin" /> {statusText}</div></div>
-              )}
+                );
+              })}
               <div ref={chatEndRef} />
             </div>
             <div className="chat-input-area">
               <textarea
+                ref={chatInputRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); } }}

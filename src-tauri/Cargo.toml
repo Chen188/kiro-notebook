@@ -27,3 +27,6 @@ docx-rs = "0.4"
 chrono = "0.4"
 libc = "0.2"
 dirs = "5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-web-kit = { version = "0.3", features = ["WKWebView"] }

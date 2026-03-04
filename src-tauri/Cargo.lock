@@ -1977,6 +1977,7 @@ dependencies = [
  "docx-rs",
  "libc",
  "lopdf",
+ "objc2-web-kit",
  "serde",
  "serde_json",
  "tauri",

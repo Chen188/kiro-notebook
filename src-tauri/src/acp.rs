@@ -163,6 +163,62 @@ impl AcpClient {
                         }
                     }
 
+                    // Agent-initiated request (has both "id" and "method"), e.g. session/request_permission
+                    if let (Some(req_id), Some(method)) = (
+                        msg.get("id"),
+                        msg.get("method").and_then(|v| v.as_str()),
+                    ) {
+                        if method == "session/request_permission" {
+                            let option_id = msg.pointer("/params/options/0/optionId")
+                                .and_then(|v| v.as_str()).unwrap_or("allow");
+                            let option_name = msg.pointer("/params/options/0/name")
+                                .and_then(|v| v.as_str()).unwrap_or("Allow");
+                            let tool_title = msg.pointer("/params/toolCall/title")
+                                .and_then(|v| v.as_str()).unwrap_or("tool");
+                            let tool_kind = msg.pointer("/params/toolCall/kind")
+                                .and_then(|v| v.as_str()).unwrap_or("");
+                            let detail = msg.pointer("/params/toolCall/rawInput")
+                                .map(|v| {
+                                    if let Some(q) = v.get("query").and_then(|q| q.as_str()) { q.to_string() }
+                                    else if let Some(u) = v.get("url").and_then(|u| u.as_str()) { u.to_string() }
+                                    else if let Some(u) = v.get("urls").and_then(|u| u.as_array()).and_then(|a| a.first()).and_then(|u| u.as_str()) { u.to_string() }
+                                    else if let Some(p) = v.get("prompt").and_then(|p| p.as_str()) { p.to_string() }
+                                    else if let Some(c) = v.get("command").and_then(|c| c.as_str()) { c.to_string() }
+                                    else if let Some(p) = v.get("path").and_then(|p| p.as_str()) { p.to_string() }
+                                    else {
+                                        let s = serde_json::to_string(v).unwrap_or_default();
+                                        if s.len() > 200 { format!("{}…", &s[..200]) } else { s }
+                                    }
+                                })
+                                .unwrap_or_default();
+                            log(&format!("Auto-allowing permission: {} (optionId={})", tool_title, option_id));
+                            let response = json!({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": { "outcome": { "outcome": "selected", "optionId": option_id } }
+                            });
+                            let resp_str = serde_json::to_string(&response).unwrap();
+                            if let Ok(mut stdin) = self.stdin.lock() {
+                                let _ = stdin.write_all(format!("{}\n", resp_str).as_bytes());
+                                let _ = stdin.flush();
+                            }
+                            let _ = app.emit("acp-status", json!({
+                                "sessionId": session_id, "type": "permission",
+                                "title": tool_title, "kind": tool_kind,
+                                "detail": detail, "option": option_name
+                            }));
+                        } else {
+                            log(&format!("Unknown agent request: {} — responding empty", method));
+                            let response = json!({ "jsonrpc": "2.0", "id": req_id, "result": {} });
+                            let resp_str = serde_json::to_string(&response).unwrap();
+                            if let Ok(mut stdin) = self.stdin.lock() {
+                                let _ = stdin.write_all(format!("{}\n", resp_str).as_bytes());
+                                let _ = stdin.flush();
+                            }
+                        }
+                        continue;
+                    }
+
                     if msg.get("method").and_then(|v| v.as_str()) == Some("session/update") {
                         if let Some(update) = msg.pointer("/params/update") {
                             let update_type = update.get("sessionUpdate").and_then(|v| v.as_str()).unwrap_or("");
@@ -176,11 +232,23 @@ impl AcpClient {
                                 "tool_call" => {
                                     let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("Working");
                                     let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
-                                    let _ = app.emit("acp-status", json!({ "sessionId": session_id, "type": "tool_call", "title": title, "status": status }));
+                                    let kind = update.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                                    let tool_call_id = update.get("toolCallId").and_then(|v| v.as_str()).unwrap_or("");
+                                    let detail = update.get("rawInput")
+                                        .map(|v| {
+                                            if let Some(q) = v.get("query").and_then(|q| q.as_str()) { q.to_string() }
+                                            else if let Some(u) = v.get("url").and_then(|u| u.as_str()) { u.to_string() }
+                                            else if let Some(c) = v.get("command").and_then(|c| c.as_str()) { c.to_string() }
+                                            else if let Some(p) = v.get("path").and_then(|p| p.as_str()) { p.to_string() }
+                                            else { String::new() }
+                                        })
+                                        .unwrap_or_default();
+                                    let _ = app.emit("acp-status", json!({ "sessionId": session_id, "type": "tool_call", "title": title, "status": status, "kind": kind, "toolCallId": tool_call_id, "detail": detail }));
                                 }
                                 "tool_call_update" => {
                                     let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                                    let _ = app.emit("acp-status", json!({ "sessionId": session_id, "type": "tool_update", "status": status }));
+                                    let title = update.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                                    let _ = app.emit("acp-status", json!({ "sessionId": session_id, "type": "tool_update", "status": status, "title": title }));
                                 }
                                 _ => {}
                             }

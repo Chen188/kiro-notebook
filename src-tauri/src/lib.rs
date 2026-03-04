@@ -5,6 +5,7 @@ mod mcp_server;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 pub fn run_mcp() {
@@ -32,6 +33,21 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(state)
+        .setup(|app| {
+            let webview_window = app
+                .get_webview_window("main")
+                .expect("main webview window not found");
+            webview_window
+                .with_webview(|webview| {
+                    #[cfg(target_os = "macos")]
+                    unsafe {
+                        let wk: &objc2_web_kit::WKWebView = &*webview.inner().cast();
+                        wk.setAllowsMagnification(true);
+                    }
+                })
+                .expect("failed to configure webview");
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::select_workspace,
             commands::list_files,
